@@ -1,4 +1,5 @@
-from datetime import datetime
+from __future__ import division
+from datetime import datetime, timedelta
 import time
 import importlib
 import json
@@ -7,7 +8,10 @@ from copy import copy
 
 from pyramid.view import view_config
 
+from nupic.frameworks.opf.metrics import MetricSpec
 from nupic.frameworks.opf.modelfactory import ModelFactory
+from nupic.frameworks.opf.predictionmetricsmanager import MetricsManager
+
 from nupic.algorithms import anomaly_likelihood
 
 models = {}
@@ -32,36 +36,35 @@ def du(unix):
     return datetime.utcfromtimestamp(float(unix))
 
 
-def dt_to_unix(dt):
-    return int((dt - datetime(1970, 1, 1)).total_seconds())
+def dt_to_unix(dt, epoch=datetime(1970,1,1)):
+    #return int((dt - datetime(1970, 1, 1)).total_seconds())
+    td = dt - epoch
+    return (td.microseconds + (td.seconds + td.days * 86400) * 10 ** 6) / 10 ** 6
 
 
 def no_model_error():
     return {'error': 'No such model'}
 
 
-def serialize_result(temporal_field, result):
+def serialize_result(model, temporal_field, result):
     if temporal_field is not None:
         result.rawInput[temporal_field] = dt_to_unix(result.rawInput[temporal_field])
-    out = dict(
-        predictionNumber=result.predictionNumber,
+    predictions = (inf[1] for inf in result.inferences)
+    out = dict(predictionNumber=result.predictionNumber,
         rawInput=result.rawInput,
-        sensorInput=dict(
-            dataRow=result.sensorInput.dataRow,
+        sensorInput=dict(dataRow=result.sensorInput.dataRow,
             dataDict=result.rawInput,
-            dataEncodings=[map(int, list(l)) for l in result.sensorInput.dataEncodings],
+            #dataEncodings=[map(int, list(l)) for l in
+            #result.sensorInput.dataEncodings],
             sequenceReset=int(result.sensorInput.sequenceReset),
-            category=result.sensorInput.category
-        ),
+            category=result.sensorInput.category),
         inferences=result.inferences,
-        metrics=result.metrics,
         predictedFieldIdx=result.predictedFieldIdx,
         predictedFieldName=result.predictedFieldName,
-        classifierInput=dict(
-            dataRow=result.classifierInput.dataRow,
-            bucketIndex=result.classifierInput.bucketIndex
+        classifierInput=dict(dataRow=result.classifierInput.dataRow,
+        bucketIndex=result.classifierInput.bucketIndex),
+        #predictions=list(predictions)
         )
-    )
     return out
 
 
@@ -98,11 +101,14 @@ def run(request):
         if temporal_field is not None:
             data[temporal_field] = du(data[temporal_field])
         resultObject = model['model'].run(data)
+        if model['metricsManager']:
+            resultObject.metrics = model['metricsManager'].update(resultObject)
         anomaly_score = resultObject.inferences["anomalyScore"]
-        responseObject = serialize_result(temporal_field, resultObject)
+        responseObject = serialize_result(model, temporal_field, resultObject)
         if temporal_field is not None:
             responseObject['anomalyLikelihood'] = model['alh'].anomalyProbability(data[model['pfield']], anomaly_score, data[temporal_field])
         responseList.append(responseObject)
+
     return responseList
 
 
@@ -151,8 +157,16 @@ def model_list(request):
 def model_create(request):
     guid = str(uuid4())
     predicted_field = None
+    metrics = None
+    inferenceArgs = None
     try:
         params = request.json_body
+        if 'params' in request.json_body:
+            params = request.json_body['params']
+        if 'metrics' in request.json_body:
+            metrics = request.json_body['metrics']
+        if 'inferenceArgs' in request.json_body:
+            inferenceArgs = request.json_body['inferenceArgs']
     except ValueError:
         params = None
 
@@ -165,9 +179,9 @@ def model_create(request):
         if 'modelParams' not in params:
             request.response.status = 400
             return {'error': 'POST body must include JSON with a modelParams value.'}
-        if 'predictedField' in params:
-            predicted_field = params['predictedField']
-        params = params['modelParams']
+        if 'predictedField' in inferenceArgs:
+            predicted_field = inferenceArgs['predictedField']
+        #params = params['modelParams']
         msg = 'Used provided model parameters'
     else:
         params = importlib.import_module('model_params.model_params').MODEL_PARAMS['modelConfig']
@@ -179,6 +193,7 @@ def model_create(request):
         model.enableInference({'predictedField': predicted_field})
     else:
         print "No predicted field enabled."
+    
     models[guid] = {
         'model': model,
         'pfield': predicted_field,
@@ -186,8 +201,18 @@ def model_create(request):
         'seen': 0,
         'last': None,
         'alh': anomaly_likelihood.AnomalyLikelihood(),
-        'tfield': find_temporal_field(params)
-    }
+        'tfield': find_temporal_field(params),
+        'metrics': metrics,
+        'metricsManager': None}
+    
+    if metrics:
+        _METRIC_SPECS = (
+            MetricSpec(field=metric['field'], metric=metric['metric'],
+                inferenceElement=metric['inferenceElement'],
+                params=metric['params'])  
+            for metric in metrics)
+        models[guid]['metricsManager'] = MetricsManager(_METRIC_SPECS, model.getFieldInfo(), model.getInferenceType())
+
     print "Made model", guid
     return {'guid': guid,
             'params': params,
