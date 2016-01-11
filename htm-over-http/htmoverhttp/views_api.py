@@ -46,10 +46,10 @@ def no_model_error():
     return {'error': 'No such model'}
 
 
-def serialize_result(model, temporal_field, result):
+def serialize_result(model, result):
+    temporal_field = model["tfield"];
     if temporal_field is not None:
         result.rawInput[temporal_field] = dt_to_unix(result.rawInput[temporal_field])
-    predictions = (inf[1] for inf in result.inferences)
     out = dict(predictionNumber=result.predictionNumber,
         rawInput=result.rawInput,
         sensorInput=dict(dataRow=result.sensorInput.dataRow,
@@ -62,9 +62,7 @@ def serialize_result(model, temporal_field, result):
         predictedFieldIdx=result.predictedFieldIdx,
         predictedFieldName=result.predictedFieldName,
         classifierInput=dict(dataRow=result.classifierInput.dataRow,
-        bucketIndex=result.classifierInput.bucketIndex),
-        #predictions=list(predictions)
-        )
+        bucketIndex=result.classifierInput.bucketIndex))
     return out
 
 
@@ -104,9 +102,11 @@ def run(request):
         if model['metricsManager']:
             resultObject.metrics = model['metricsManager'].update(resultObject)
         anomaly_score = resultObject.inferences["anomalyScore"]
-        responseObject = serialize_result(model, temporal_field, resultObject)
-        if temporal_field is not None:
+        responseObject = serialize_result(model, resultObject)
+        if temporal_field is not None and anomaly_score is not None:
             responseObject['anomalyLikelihood'] = model['alh'].anomalyProbability(data[model['pfield']], anomaly_score, data[temporal_field])
+        else:
+            responseObject['anomalyLikelihood'] = None
         responseList.append(responseObject)
 
     return responseList
