@@ -11,6 +11,7 @@ from pyramid.view import view_config
 from nupic.frameworks.opf.metrics import MetricSpec
 from nupic.frameworks.opf.modelfactory import ModelFactory
 from nupic.frameworks.opf.predictionmetricsmanager import MetricsManager
+from nupic.data.inference_shifter import InferenceShifter
 
 from nupic.algorithms import anomaly_likelihood
 
@@ -32,25 +33,43 @@ def reset(request):
     return {'success': has_model, 'guid': guid}
 
 
-def du(unix):
-    return datetime.utcfromtimestamp(float(unix))
+def du(datestring):
+    DATE_FORMATS = ['%Y-%m-%d %H:%M:%S.%f',
+                    '%Y-%m-%d %H:%M:%S:%f',
+                    '%Y-%m-%d %H:%M:%S',
+                    '%Y-%m-%d %H:%M',
+                    '%Y-%m-%d',
+                    '%m/%d/%Y %H:%M',
+                    '%m/%d/%y %H:%M',
+                    '%Y-%m-%dT%H:%M:%S.%fZ',
+                    '%Y-%m-%dT%H:%M:%SZ',
+                    '%Y-%m-%dT%H:%M:%S']
+    if datestring.isdigit():
+        dt = datetime.utcfromtimestamp(float(unix))
+    else:
+        for date_format in DATE_FORMATS:
+            try:
+                dt = datetime.strptime(datestring, date_format)
+            except ValueError:
+                pass
+            else:
+              break
+        else:
+            dt = None
+    return dt;    
 
-
-def dt_to_unix(dt, epoch=datetime(1970,1,1)):
-    #return int((dt - datetime(1970, 1, 1)).total_seconds())
-    td = dt - epoch
-    return (td.microseconds + (td.seconds + td.days * 86400) * 10 ** 6) / 10 ** 6
-
+#def dt_to_unix(dt, epoch=datetime(1970,1,1)):
+#    return int((dt - datetime(1970, 1, 1)).total_seconds())
 
 def no_model_error():
     return {'error': 'No such model'}
 
-
 def serialize_result(model, result):
     temporal_field = model["tfield"];
-    if temporal_field is not None:
-        result.rawInput[temporal_field] = dt_to_unix(result.rawInput[temporal_field])
-    out = dict(predictionNumber=result.predictionNumber,
+    #if temporal_field is not None:
+    #    result.rawInput[temporal_field] = dt_to_unix(result.rawInput[temporal_field])
+    out = dict(
+        predictionNumber=result.predictionNumber,
         rawInput=result.rawInput,
         sensorInput=dict(dataRow=result.sensorInput.dataRow,
             dataDict=result.rawInput,
@@ -61,8 +80,15 @@ def serialize_result(model, result):
         inferences=result.inferences,
         predictedFieldIdx=result.predictedFieldIdx,
         predictedFieldName=result.predictedFieldName,
-        classifierInput=dict(dataRow=result.classifierInput.dataRow,
-        bucketIndex=result.classifierInput.bucketIndex))
+        classifierInput=result.classifierInput,
+        metrics=result.metrics)
+    anomaly_score = result.inferences["anomalyScore"]
+    
+    if temporal_field is not None and anomaly_score is not None:
+        pfield = result.predictedFieldName
+        out['anomalyLikelihood'] = model['alh'].anomalyProbability(result.rawInput[pfield], anomaly_score, result.rawInput[temporal_field])
+    else:
+        out['anomalyLikelihood'] = None
     return out
 
 
@@ -80,14 +106,15 @@ def run(request):
     if not has_model:
         request.response.status = 404
         return no_model_error()
-    print guid, '<-', request.json_body
+    print 'run', guid
+    #print 'run', guid, 'request', request.json_body
     responseList = []
     if type(request.json_body) is list:
         rows = request.json_body
     else:
         rows = [request.json_body]
     for row in rows:
-        data = {k: float(v) for k, v in row.items()}
+        data = row #{k: float(v) for k, v in row.items()}
         model = models[guid]
         temporal_field = model['tfield']
         if temporal_field is not None and model['last'] and (data[temporal_field] < model['last'][temporal_field]):
@@ -98,17 +125,26 @@ def run(request):
         # turn the timestamp field into a datetime obj
         if temporal_field is not None:
             data[temporal_field] = du(data[temporal_field])
-        resultObject = model['model'].run(data)
-        if model['metricsManager']:
-            resultObject.metrics = model['metricsManager'].update(resultObject)
-        anomaly_score = resultObject.inferences["anomalyScore"]
-        responseObject = serialize_result(model, resultObject)
-        if temporal_field is not None and anomaly_score is not None:
-            responseObject['anomalyLikelihood'] = model['alh'].anomalyProbability(data[model['pfield']], anomaly_score, data[temporal_field])
-        else:
-            responseObject['anomalyLikelihood'] = None
+        
+        result = model['model'].run(data)
+        #print 'run', guid, 'result', result
+
+        metrics = None
+        metricsManager = model['metricsManager']
+        if metricsManager is not None:
+            metrics = metricsManager.update(result)
+            result.metrics = metrics
+
+        inferenceShifter = model["inferenceShifter"]
+        if inferenceShifter is not None:
+            result = inferenceShifter.shift(result)
+            result.metrics = metrics
+            #print 'run', guid, 'shifted', resultObject
+
+        responseObject = serialize_result(model, result)
         responseList.append(responseObject)
 
+    #print 'run', guid, 'response', responseList
     return responseList
 
 
@@ -140,13 +176,13 @@ def serialize_model(guid):
     data = models[guid]
     return {
         'guid': guid,
-        'predicted_field': data['pfield'],
-        'tfield': data['tfield'],
+        'metrics': data['metrics'],
+        'inferenceArgs': data['inferenceArgs'],
         'params': data['params'],
+        'tfield': data['tfield'],
         'last': data['last'],
         'seen': data['seen']
     }
-
 
 @view_config(route_name='model_create', renderer='json', request_method='GET')
 def model_list(request):
@@ -156,7 +192,6 @@ def model_list(request):
 @view_config(route_name='model_create', renderer='json', request_method='POST')
 def model_create(request):
     guid = str(uuid4())
-    predicted_field = None
     metrics = None
     inferenceArgs = None
     try:
@@ -179,44 +214,49 @@ def model_create(request):
         if 'modelParams' not in params:
             request.response.status = 400
             return {'error': 'POST body must include JSON with a modelParams value.'}
-        if 'predictedField' in inferenceArgs:
-            predicted_field = inferenceArgs['predictedField']
-        #params = params['modelParams']
         msg = 'Used provided model parameters'
     else:
         params = importlib.import_module('model_params.model_params').MODEL_PARAMS['modelConfig']
-        msg = 'Using default parameters, timestamp is field c0 and input and predictedField is c1'
-        predicted_field = 'c1'
+        print 'Using default model, timestamp is field c0'
+
     model = ModelFactory.create(params)
-    if predicted_field is not None:
-        print "Enabled predicted field: {0}".format(predicted_field)
-        model.enableInference({'predictedField': predicted_field})
+
+    if inferenceArgs is None:
+        inferenceArgs = dict(predictedField='c1')
+        print 'Using default predictedField c1'
+
+    if inferenceArgs["predictedField"] is None:
+        print 'No prediciton field'
+        inferenceShifter = None
     else:
-        print "No predicted field enabled."
-    
-    models[guid] = {
-        'model': model,
-        'pfield': predicted_field,
-        'params': params,
-        'seen': 0,
-        'last': None,
-        'alh': anomaly_likelihood.AnomalyLikelihood(),
-        'tfield': find_temporal_field(params),
-        'metrics': metrics,
-        'metricsManager': None}
-    
+        model.enableInference(inferenceArgs)
+        inferenceShifter = InferenceShifter();
+
     if metrics:
         _METRIC_SPECS = (
             MetricSpec(field=metric['field'], metric=metric['metric'],
                 inferenceElement=metric['inferenceElement'],
                 params=metric['params'])  
             for metric in metrics)
-        models[guid]['metricsManager'] = MetricsManager(_METRIC_SPECS, model.getFieldInfo(), model.getInferenceType())
+        metricsManager = MetricsManager(_METRIC_SPECS, model.getFieldInfo(), model.getInferenceType())
+    else:
+        metricsManager = None
+
+    models[guid] = {
+        'model': model,
+        'inferenceArgs': inferenceArgs,
+        'inferenceShifter': inferenceShifter,
+        'params': params,
+        'seen': 0,
+        'last': None,
+        'alh': anomaly_likelihood.AnomalyLikelihood(),
+        'tfield': find_temporal_field(params),
+        'metrics': metrics,
+        'metricsManager': metricsManager}
+    
+
 
     print "Made model", guid
-    return {'guid': guid,
-            'params': params,
-            'predicted_field': predicted_field,
-            'info': msg,
-            'tfield': models[guid]['tfield']}
+    return serialize_model(guid);
+
 
