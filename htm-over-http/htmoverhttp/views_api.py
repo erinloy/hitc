@@ -80,8 +80,9 @@ def serialize_result(model, result):
         inferences=result.inferences,
         predictedFieldIdx=result.predictedFieldIdx,
         predictedFieldName=result.predictedFieldName,
-        classifierInput=result.classifierInput,
+        #classifierInput=result.classifierInput,
         metrics=result.metrics)
+        #bucketIndex=result.classifierInput.bucketIndex)
     anomaly_score = result.inferences["anomalyScore"]
     
     if temporal_field is not None and anomaly_score is not None:
@@ -230,11 +231,12 @@ def model_create(request):
         inferenceShifter = None
     else:
         model.enableInference(inferenceArgs)
+        print model_create, guid, 'inferenceType', model.getInferenceType()
+        print model_create, guid, 'inferenceArgs', model.getInferenceArgs()
         inferenceShifter = InferenceShifter();
 
     if metrics:
-        _METRIC_SPECS = (
-            MetricSpec(field=metric['field'], metric=metric['metric'],
+        _METRIC_SPECS = (MetricSpec(field=metric['field'], metric=metric['metric'],
                 inferenceElement=metric['inferenceElement'],
                 params=metric['params'])  
             for metric in metrics)

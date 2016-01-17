@@ -106,3 +106,4 @@ docs/_build/
 # PyBuilder
 target/
 
+*.suo
