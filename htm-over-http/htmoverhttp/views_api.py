@@ -56,20 +56,20 @@ def du(datestring):
               break
         else:
             dt = None
-    return dt;    
+    return dt    
 
 #def dt_to_unix(dt, epoch=datetime(1970,1,1)):
 #    return int((dt - datetime(1970, 1, 1)).total_seconds())
-
 def no_model_error():
     return {'error': 'No such model'}
 
 def serialize_result(model, result):
-    temporal_field = model["tfield"];
+    temporal_field = model["tfield"]
     #if temporal_field is not None:
-    #    result.rawInput[temporal_field] = dt_to_unix(result.rawInput[temporal_field])
-    out = dict(
-        predictionNumber=result.predictionNumber,
+    #    result.rawInput[temporal_field] =
+    #    dt_to_unix(result.rawInput[temporal_field])
+    
+    out = dict(predictionNumber=result.predictionNumber,
         rawInput=result.rawInput,
         sensorInput=dict(dataRow=result.sensorInput.dataRow,
             dataDict=result.rawInput,
@@ -134,6 +134,7 @@ def run(request):
         metricsManager = model['metricsManager']
         if metricsManager is not None:
             metrics = metricsManager.update(result)
+            print 'run', guid, 'metrics', metrics
             result.metrics = metrics
 
         inferenceShifter = model["inferenceShifter"]
@@ -233,13 +234,27 @@ def model_create(request):
         model.enableInference(inferenceArgs)
         print model_create, guid, 'inferenceType', model.getInferenceType()
         print model_create, guid, 'inferenceArgs', model.getInferenceArgs()
-        inferenceShifter = InferenceShifter();
+        inferenceShifter = InferenceShifter()
 
-    if metrics:
-        _METRIC_SPECS = (MetricSpec(field=metric['field'], metric=metric['metric'],
-                inferenceElement=metric['inferenceElement'],
-                params=metric['params'])  
-            for metric in metrics)
+    #if metrics:
+        #_METRIC_SPECS = (MetricSpec(field=metric['field'],
+        #metric=metric['metric'],
+        #        inferenceElement=metric['inferenceElement'],
+        #        params=metric['params'])
+        #    for metric in metrics)
+    if inferenceArgs["predictedField"] is not None and params['predictAheadTime'] is not None:
+        _METRIC_SPECS = (MetricSpec(field=inferenceArgs["predictedField"], metric='multiStep',
+                       inferenceElement='multiStepBestPredictions',
+                       params={'errorMetric': 'aae', 'window': 1000, 'steps': params['predictAheadTime']}),
+            MetricSpec(field=inferenceArgs["predictedField"], metric='trivial',
+                       inferenceElement='prediction',
+                       params={'errorMetric': 'aae', 'window': 1000, 'steps': params['predictAheadTime']}),
+            MetricSpec(field=inferenceArgs["predictedField"], metric='multiStep',
+                       inferenceElement='multiStepBestPredictions',
+                       params={'errorMetric': 'altMAPE', 'window': 1000, 'steps': params['predictAheadTime']}),
+            MetricSpec(field=inferenceArgs["predictedField"], metric='trivial',
+                       inferenceElement='prediction',
+                       params={'errorMetric': 'altMAPE', 'window': 1000, 'steps': params['predictAheadTime']}),)
         metricsManager = MetricsManager(_METRIC_SPECS, model.getFieldInfo(), model.getInferenceType())
     else:
         metricsManager = None
@@ -259,6 +274,5 @@ def model_create(request):
 
 
     print "Made model", guid
-    return serialize_model(guid);
-
+    return serialize_model(guid)
 
